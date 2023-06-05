@@ -160,9 +160,23 @@ func readData(packet gopacket.Packet) {
 			return
 		}
 		log.Printf("Client hello from port %s to %s", t.SrcPort, t.DstPort)
-		fmt.Println(hello)
+		calcJA3(hello)
 	} else {
 		log.Println("Client Hello Reader could not decode TCP layer")
 		return
 	}
+}
+
+func calcJA3(hello tlsx.ClientHello) {
+	fmt.Println(hello)
+	fmt.Printf("Version: %d\n", hello.Version)
+	fmt.Printf("Extensions: ")
+	for e := range hello.Extensions {
+		fmt.Printf("%d ", e)
+	}
+	fmt.Printf("\nCiphers: ")
+	for e := range hello.CipherSuites {
+		fmt.Printf("%d ", e)
+	}
+	fmt.Printf("\n")
 }
