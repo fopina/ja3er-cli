@@ -13,11 +13,12 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strings"
 	"time"
 
-	"github.com/google/gopacket/dumpcommand"
+	"github.com/bradleyfalzon/tlsx"
+	"github.com/google/gopacket"
 	"github.com/google/gopacket/examples/util"
+	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 )
 
@@ -26,6 +27,9 @@ var fname = flag.String("r", "", "Filename to read from, overrides -i")
 var snaplen = flag.Int("s", 65536, "Snap length (number of bytes max to read per packet")
 var tstype = flag.String("timestamp_type", "", "Type of timestamps to use")
 var promisc = flag.Bool("promisc", true, "Set promiscuous mode")
+var decoder = flag.String("decoder", "Ethernet", "Name of the decoder to use")
+var filter = flag.String("filter", "(tcp[((tcp[12] & 0xf0) >>2)] = 0x16) && (tcp[((tcp[12] & 0xf0) >>2)+5] = 0x01)", "Set the filter but default is set for TLS handshakes")
+var dump = flag.Bool("X", false, "If true, dump very verbose info on each packet")
 
 func main() {
 	defer util.Run()()
@@ -63,12 +67,102 @@ func main() {
 		}
 		defer handle.Close()
 	}
-	if len(flag.Args()) > 0 {
-		bpffilter := strings.Join(flag.Args(), " ")
-		fmt.Fprintf(os.Stderr, "Using BPF filter %q\n", bpffilter)
-		if err = handle.SetBPFFilter(bpffilter); err != nil {
+	if *filter != "" {
+		fmt.Fprintf(os.Stderr, "Using BPF filter %q\n", *filter)
+		if err = handle.SetBPFFilter(*filter); err != nil {
 			log.Fatal("BPF filter error:", err)
 		}
 	}
-	dumpcommand.Run(handle)
+	Run(handle)
+}
+
+func Run(src gopacket.PacketDataSource) {
+	if !flag.Parsed() {
+		log.Fatalln("Run called without flags.Parse() being called")
+	}
+	var dec gopacket.Decoder
+	var ok bool
+	if dec, ok = gopacket.DecodersByLayerName[*decoder]; !ok {
+		log.Fatalln("No decoder named", *decoder)
+	}
+	source := gopacket.NewPacketSource(src, dec)
+	source.Lazy = false
+	source.NoCopy = true
+	source.DecodeStreamsAsDatagrams = true
+	fmt.Fprintln(os.Stderr, "Starting to read packets")
+	count := 0
+	bytes := int64(0)
+	errors := 0
+	truncated := 0
+	layertypes := map[gopacket.LayerType]int{}
+
+	for packet := range source.Packets() {
+		count++
+		bytes += int64(len(packet.Data()))
+
+		if *dump {
+			fmt.Println(packet.Dump())
+		}
+
+		for _, layer := range packet.Layers() {
+			layertypes[layer.LayerType()]++
+		}
+		if packet.Metadata().Truncated {
+			truncated++
+		}
+		if errLayer := packet.ErrorLayer(); errLayer != nil {
+			errors++
+			fmt.Println("Error:", errLayer.Error())
+			fmt.Println("--- Packet ---")
+			fmt.Println(packet.Dump())
+		}
+		go readPacket(packet)
+	}
+}
+
+func readPacket(packet gopacket.Packet) {
+	if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+		tcp, ok := tcpLayer.(*layers.TCP)
+		if !ok {
+			log.Println("Could not decode TCP layer")
+			return
+		}
+		if tcp.SYN {
+			// Connection setup
+		} else if tcp.FIN {
+			// Connection teardown
+		} else if tcp.ACK && len(tcp.LayerPayload()) == 0 {
+			// Acknowledgement packet
+		} else if tcp.RST {
+			// Unexpected packet
+		} else {
+			// data packet
+			readData(packet)
+		}
+	}
+}
+
+func readData(packet gopacket.Packet) {
+	if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+		t, _ := tcpLayer.(*layers.TCP)
+
+		var hello = tlsx.ClientHello{}
+
+		err := hello.Unmarshall(t.LayerPayload())
+
+		switch err {
+		case nil:
+		case tlsx.ErrHandshakeWrongType:
+			return
+		default:
+			log.Println("Error reading Client Hello:", err)
+			log.Println("Raw Client Hello:", t.LayerPayload())
+			return
+		}
+		log.Printf("Client hello from port %s to %s", t.SrcPort, t.DstPort)
+		fmt.Println(hello)
+	} else {
+		log.Println("Client Hello Reader could not decode TCP layer")
+		return
+	}
 }
